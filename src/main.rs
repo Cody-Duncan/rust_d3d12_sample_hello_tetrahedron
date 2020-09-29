@@ -2,8 +2,10 @@
 mod win_window;
 mod win_utilities;
 mod win_platform;
+pub mod dx_descriptor_handles;
 mod dx_renderer;
 mod geometry;
+mod transforms;
 
 // Use Declarations
 use std::thread;

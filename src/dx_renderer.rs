@@ -1,14 +1,15 @@
 extern crate d3d12_rs;
 extern crate winapi;
 use crate::win_window;
-use crate::geometry;
 use crate::geometry::*;
+use crate::transforms;
+use crate::dx_descriptor_handles::{CD3D12_CPU_DESCRIPTOR_HANDLE, CD3D12_GPU_DESCRIPTOR_HANDLE};
+use cgmath::*;
 
 use winapi::{
 	shared::{
 		dxgi, dxgi1_2, dxgi1_3, dxgi1_4, winerror, dxgiformat, dxgitype,  
 		minwindef::{FALSE, TRUE, UINT}, 
-		basetsd::{SIZE_T},
 		ntdef::HANDLE,
 	},
 	//dxgi1_6, minwindef::TRUE, winerror},
@@ -43,6 +44,15 @@ const G_MAX_FRAME_COUNT : usize = 3;
 const G_SINGLE_NODEMASK : u32 = 0;
 const G_WIDTH : u32 = 1280;
 const G_HEIGHT : u32 = 720;
+const FOVY : f32 = 90.0;
+const ASPECT_RATIO : f32 = G_WIDTH as f32 / G_HEIGHT as f32;
+
+struct MatrixConstantBuffer
+{
+	#[allow(dead_code)]
+	mvp_transform : cgmath::Matrix4<f32>,
+	_padding : [u8 ; 192]
+}
 
 #[allow(dead_code)]
 pub struct Renderer 
@@ -56,6 +66,7 @@ pub struct Renderer
 	swap_chain : WeakPtr<dxgi1_4::IDXGISwapChain3>,
 	rtv_descriptor_heap : WeakPtr<d3d12::ID3D12DescriptorHeap>,
 	rtv_descriptor_size : u32,
+	cbv_descriptor_heap : WeakPtr<d3d12::ID3D12DescriptorHeap>,
 	command_allocators : [WeakPtr::<d3d12::ID3D12CommandAllocator> ; G_MAX_FRAME_COUNT],
 	command_list : WeakPtr::<d3d12::ID3D12GraphicsCommandList>,
 	render_targets : [WeakPtr<d3d12::ID3D12Resource>; G_MAX_FRAME_COUNT],
@@ -65,9 +76,13 @@ pub struct Renderer
 	frame_index : usize,
 	vertex_buffer : WeakPtr<d3d12::ID3D12Resource>,
 	vertex_buffer_view : d3d12::D3D12_VERTEX_BUFFER_VIEW,
+	constant_buffer : WeakPtr<d3d12::ID3D12Resource>,
+	constant_buffer_gpu_handle : CD3D12_GPU_DESCRIPTOR_HANDLE,	
+	p_cbv_data : * mut MatrixConstantBuffer,
 	fence : WeakPtr<d3d12::ID3D12Fence>,
 	fence_values : [u64 ; G_MAX_FRAME_COUNT],
 	fence_event : HANDLE,
+	timer : std::time::Instant,
 }
 
 fn to_wchar(str : &str) -> Vec<u16> 
@@ -80,54 +95,6 @@ fn to_cstring(str : &str) -> CString
 	CString::new(str).unwrap()
 }
 
-#[repr(transparent)]
-#[allow(non_camel_case_types)]
-struct CD3D12_CPU_DESCRIPTOR_HANDLE(winapi::um::d3d12::D3D12_CPU_DESCRIPTOR_HANDLE);
-
-impl CD3D12_CPU_DESCRIPTOR_HANDLE
-{
-	#[allow(dead_code)]
-	pub fn new() -> Self
-	{
-		Self
-		{
-			0 : winapi::um::d3d12::D3D12_CPU_DESCRIPTOR_HANDLE { ptr : 0 }
-		}
-	}
-
-	pub fn offset_cpu_descriptor_handle(
-		handle : &winapi::um::d3d12::D3D12_CPU_DESCRIPTOR_HANDLE, 
-		offset_index : i32, 
-		descriptor_increment_size : u32) -> winapi::um::d3d12::D3D12_CPU_DESCRIPTOR_HANDLE
-	{
-		let ptr_64 = handle.ptr as i64;
-		let offset_index_64 = offset_index as i64;
-		let descriptor_increment_size_64 = descriptor_increment_size as i64;
-		let result = (ptr_64 + offset_index_64 * descriptor_increment_size_64) as SIZE_T;
-		return winapi::um::d3d12::D3D12_CPU_DESCRIPTOR_HANDLE { ptr : result };
-	}
-
-	pub fn from_offset(
-		other : &winapi::um::d3d12::D3D12_CPU_DESCRIPTOR_HANDLE, 
-		offset_index : i32, 
-		descriptor_increment_size : u32) -> Self
-	{
-		Self
-		{
-			0 : Self::offset_cpu_descriptor_handle(&other, offset_index, descriptor_increment_size)
-		}
-	}
-
-	pub fn offset(
-		&mut self, 
-		offset_index : i32, 
-		descriptor_increment_size : u32) -> & mut Self
-	{
-		self.0 = Self::offset_cpu_descriptor_handle(&self.0, offset_index, descriptor_increment_size);
-		self
-	}
-}
-
 impl Renderer 
 {
 
@@ -137,7 +104,8 @@ pub fn new() -> Self
 	{
 		let mut debug_controller = WeakPtr::<d3d12sdklayers::ID3D12Debug>::null();
         let hr_debug = unsafe {
-            winapi::um::d3d12::D3D12GetDebugInterface(&d3d12sdklayers::ID3D12Debug::uuidof(), debug_controller.mut_void())};
+			winapi::um::d3d12::D3D12GetDebugInterface(&d3d12sdklayers::ID3D12Debug::uuidof(), debug_controller.mut_void())
+		};
 		assert!(winerror::SUCCEEDED(hr_debug), "Unable to get D3D12 debug interface. {:x}", hr_debug);
 		
 		debug_controller.enable_layer();
@@ -172,6 +140,7 @@ pub fn new() -> Self
 		swap_chain : WeakPtr::<dxgi1_4::IDXGISwapChain3>::null(),
 		rtv_descriptor_heap : WeakPtr::<d3d12::ID3D12DescriptorHeap>::null(),
 		rtv_descriptor_size : 0,
+		cbv_descriptor_heap : WeakPtr::<d3d12::ID3D12DescriptorHeap>::null(),
 		command_allocators : [WeakPtr::<d3d12::ID3D12CommandAllocator>::null(); G_MAX_FRAME_COUNT],
 		command_list : WeakPtr::<d3d12::ID3D12GraphicsCommandList>::null(),
 		render_targets : [WeakPtr::null(); G_MAX_FRAME_COUNT],
@@ -181,9 +150,13 @@ pub fn new() -> Self
 		frame_index : 0,
 		vertex_buffer : WeakPtr::<d3d12::ID3D12Resource>::null(),
 		vertex_buffer_view : unsafe { mem::zeroed() },
+		constant_buffer : WeakPtr::<d3d12::ID3D12Resource>::null(),
+		constant_buffer_gpu_handle : CD3D12_GPU_DESCRIPTOR_HANDLE::new(),
+		p_cbv_data : ptr::null_mut(),
 		fence : WeakPtr::<d3d12::ID3D12Fence>::null(),
 		fence_values : [0; G_MAX_FRAME_COUNT],
 		fence_event : ptr::null_mut(),
+		timer : std::time::Instant::now()
 	}
 }
 
@@ -349,7 +322,14 @@ pub fn load_pipeline(&mut self, window : win_window::Window)
 		};
 	assert!(winerror::SUCCEEDED(descriptor_heap_hr), "error on descriptor_heap creation 0x{:x}", descriptor_heap_hr);
 	self.rtv_descriptor_heap = rtv_descriptor_heap;
+	unsafe
+	{
+		let buffer_name : String = String::from("rtv descriptor heap");
+		let buffer_size = u32::try_from(buffer_name.len()).unwrap();
+		self.rtv_descriptor_heap.SetPrivateData(&d3dcommon::WKPDID_D3DDebugObjectName, buffer_size, buffer_name.as_ptr() as * mut _);
+	}
 
+	// Create Render Target Views on the RTV Heap
 	let rtv_descriptor_size = unsafe { self.device.GetDescriptorHandleIncrementSize(heap_type as _) };
 	self.rtv_descriptor_size = rtv_descriptor_size;
 	let rtv_heap_cpu_handle = rtv_descriptor_heap.start_cpu_descriptor();
@@ -367,6 +347,30 @@ pub fn load_pipeline(&mut self, window : win_window::Window)
 			self.device.CreateRenderTargetView(render_target_ref.as_mut_ptr(), ptr::null(), rtv_cpu_handle.0);
 			rtv_cpu_handle.offset(1, rtv_descriptor_size);
 		}
+	}
+
+	// Create Constant Buffer Descriptor Heap
+	let mut cbv_descriptor_heap = WeakPtr::<d3d12::ID3D12DescriptorHeap>::null();
+	let cbv_descriptor_heap_desc = d3d12::D3D12_DESCRIPTOR_HEAP_DESC 
+	{
+		Type: d3d12::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+		NumDescriptors: 1,
+		Flags: d3d12::D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+		NodeMask: G_SINGLE_NODEMASK
+	};
+	let cbv_descriptor_heap_hr = unsafe {
+		self.device.CreateDescriptorHeap(
+			&cbv_descriptor_heap_desc,
+			&d3d12::ID3D12DescriptorHeap::uuidof(),
+			cbv_descriptor_heap.mut_void())
+		};
+	assert!(winerror::SUCCEEDED(cbv_descriptor_heap_hr), "error on constant buffer descriptor heap creation 0x{:x}", cbv_descriptor_heap_hr);
+	self.cbv_descriptor_heap = cbv_descriptor_heap;
+	unsafe
+	{
+		let buffer_name : String = String::from("cbv descriptor heap");
+		let buffer_size = u32::try_from(buffer_name.len()).unwrap();
+		self.cbv_descriptor_heap.SetPrivateData(&d3dcommon::WKPDID_D3DDebugObjectName, buffer_size, buffer_name.as_ptr() as * mut _);
 	}
 
 	// Create Command Allocators
@@ -435,27 +439,54 @@ pub fn load_assets(&mut self)
 	// Create an empty Root Signature
 	let mut signature_raw = WeakPtr::<d3dcommon::ID3DBlob>::null();
 	let mut signature_error = WeakPtr::<d3dcommon::ID3DBlob>::null();
-	let parameters: &[d3d12::D3D12_ROOT_PARAMETER] = &[];
-	let static_samplers: &[d3d12::D3D12_STATIC_SAMPLER_DESC] = &[];
-	let flags = d3d12::D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-	
-	let root_signature_desc = d3d12::D3D12_ROOT_SIGNATURE_DESC {
-		NumParameters: parameters.len() as _,
-		pParameters: parameters.as_ptr() as *const _,
-		NumStaticSamplers: static_samplers.len() as _,
-		pStaticSamplers: static_samplers.as_ptr() as _,
-		Flags: flags,
+
+	// TODO Create a root signature consisting of a descriptor table with a single CBV.
+	let ranges = [
+		d3d12::D3D12_DESCRIPTOR_RANGE1
+		{
+			RangeType : d3d12::D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+			NumDescriptors : 1,
+			BaseShaderRegister : 0,
+			RegisterSpace : 0,
+			Flags: d3d12::D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC,
+			OffsetInDescriptorsFromTableStart : d3d12::D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+		}
+	];
+
+	let root_descriptor_table = d3d12::D3D12_ROOT_DESCRIPTOR_TABLE1
+	{
+		NumDescriptorRanges : ranges.len() as u32,
+		pDescriptorRanges : ranges.as_ptr()
 	};
 
+	let mut root_parameter_desc_table : d3d12::D3D12_ROOT_PARAMETER1 = unsafe { std::mem::zeroed() };
+	root_parameter_desc_table.ParameterType = d3d12::D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	root_parameter_desc_table.ShaderVisibility = d3d12::D3D12_SHADER_VISIBILITY_ALL;
+	unsafe { *root_parameter_desc_table.u.DescriptorTable_mut() = root_descriptor_table; }
+
+	let root_parameters = [root_parameter_desc_table];
+	let static_samplers: &[d3d12::D3D12_STATIC_SAMPLER_DESC] = &[];
+	let root_signature_flags = d3d12::D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+	let root_signature_desc_1_1 = d3d12::D3D12_ROOT_SIGNATURE_DESC1 {
+		NumParameters: root_parameters.len() as _,
+		pParameters: root_parameters.as_ptr() as *const _,
+		NumStaticSamplers: static_samplers.len() as _,
+		pStaticSamplers: static_samplers.as_ptr() as _,
+		Flags: root_signature_flags,
+	};
+
+	let mut root_signature_desc : d3d12::D3D12_VERSIONED_ROOT_SIGNATURE_DESC = unsafe { std::mem::zeroed() };
+	root_signature_desc.Version = d3d12::D3D_ROOT_SIGNATURE_VERSION_1_1;
+	unsafe { *root_signature_desc.u.Desc_1_1_mut() = root_signature_desc_1_1; }
+
 	let hr_seralize_root_signature = unsafe {
-		d3d12::D3D12SerializeRootSignature(
+		d3d12::D3D12SerializeVersionedRootSignature( // TODO try making this VersionedRootSIgnature instead of non-versioned?
 			&root_signature_desc,
-			d3d12::D3D_ROOT_SIGNATURE_VERSION_1_0 as _,
 			signature_raw.mut_void() as *mut *mut _,
 			signature_error.mut_void() as *mut *mut _,
 		)
 	};
-	assert!(winerror::SUCCEEDED(hr_seralize_root_signature), "Failed to serialize root signature. 0x{:x}", hr_seralize_root_signature);
 
 	if !signature_error.is_null() 
 	{
@@ -465,6 +496,8 @@ pub fn load_assets(&mut self)
 		);
 		unsafe { signature_error.destroy(); }
 	}
+
+	assert!(winerror::SUCCEEDED(hr_seralize_root_signature), "Failed to serialize root signature. 0x{:x}", hr_seralize_root_signature);
 
 	// Create the pipline state, which includes compiling and loading shaders.
 	let mut root_signature = WeakPtr::<d3d12::ID3D12RootSignature>::null();
@@ -478,6 +511,13 @@ pub fn load_assets(&mut self)
 		)};
 	assert!(winerror::SUCCEEDED(root_signature_hr), "Failed to create root signature. 0x{:x}", root_signature_hr);
     unsafe { signature_raw.destroy(); } 
+
+	unsafe
+	{
+		let buffer_name : String = String::from("root signature");
+		let buffer_size = u32::try_from(buffer_name.len()).unwrap();
+		root_signature.SetPrivateData(&d3dcommon::WKPDID_D3DDebugObjectName, buffer_size, buffer_name.as_ptr() as * mut _);
+	}
 
 	self.root_signature = root_signature;
 
@@ -694,6 +734,10 @@ pub fn load_assets(&mut self)
 			pipeline.mut_void());
 
 		assert!(winerror::SUCCEEDED(hr_gpstate), "Failed to create graphics pipeline state. 0x{:x}", hr_gpstate);
+
+		let buffer_name : String = String::from("graphics pipeline state");
+		let buffer_size = u32::try_from(buffer_name.len()).unwrap();
+		pipeline.SetPrivateData(&d3dcommon::WKPDID_D3DDebugObjectName, buffer_size, buffer_name.as_ptr() as * mut _);
 	}
 	self.pipeline_state = pipeline;
 
@@ -720,13 +764,11 @@ pub fn load_assets(&mut self)
 	// Create Triangle Assets
 	// Upload to Vertex Buffer.
 	{
-		let mut triangle_vertices : [geometry::ColoredVertex ; 3] = sample_colored_triangle_vertices();
+		let mut triangle_vertices = sample_colored_tetrahedron_vertices();
 		let triangle_vertices_size = std::mem::size_of_val(&triangle_vertices);
 		let triangle_vertices_size_u32 = u32::try_from(triangle_vertices_size).expect("Failed Type Conversion: usize -> u32");
 		let vertex_size = std::mem::size_of_val(&triangle_vertices[0]);
 		let vertex_size_u32 = u32::try_from(vertex_size).expect("Failed Type Conversion: usize -> u32");
-
-		assert!(triangle_vertices_size == 84);
 
 		let default_heap_properties = d3d12::D3D12_HEAP_PROPERTIES {
 			Type: d3d12::D3D12_HEAP_TYPE_UPLOAD,
@@ -774,7 +816,7 @@ pub fn load_assets(&mut self)
 		
 		let mut p_vertex_data_begin = ptr::null_mut::<winapi::ctypes::c_void>();
 
-		let read_range = d3d12::D3D12_RANGE { Begin: 0 , End: 0};
+		let read_range = d3d12::D3D12_RANGE { Begin: 0 , End: 0 };
 		unsafe 
 		{
 			let hr_map = vertex_buffer.Map(0, &read_range, &mut p_vertex_data_begin);
@@ -784,7 +826,7 @@ pub fn load_assets(&mut self)
 			std::ptr::copy_nonoverlapping(
 				triangle_vertices.as_mut_ptr(),
 				p_vertex_data_begin as * mut ColoredVertex,
-				triangle_vertices_size);
+				triangle_vertices.len());
 
 			vertex_buffer.Unmap(0, ptr::null());
 		}
@@ -795,36 +837,145 @@ pub fn load_assets(&mut self)
 			SizeInBytes: triangle_vertices_size_u32,
 			StrideInBytes: vertex_size_u32,
 		};
-		assert!(self.vertex_buffer_view.StrideInBytes == 28);
-		assert!(self.vertex_buffer_view.SizeInBytes == 84);
+	}
+
+	// Create constant buffer.
+	{
+		let constant_buffer_size = std::mem::size_of::<MatrixConstantBuffer>();  // CB size is required to be 256-byte aligned.
+
+		let default_heap_properties = d3d12::D3D12_HEAP_PROPERTIES {
+			Type: d3d12::D3D12_HEAP_TYPE_UPLOAD,
+			CPUPageProperty: d3d12::D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+			MemoryPoolPreference: d3d12::D3D12_MEMORY_POOL_UNKNOWN,
+			CreationNodeMask: G_SINGLE_NODEMASK,
+			VisibleNodeMask: G_SINGLE_NODEMASK,
+		};
+
+		let constant_buffer_resource_desc = d3d12::D3D12_RESOURCE_DESC {
+			Dimension: d3d12::D3D12_RESOURCE_DIMENSION_BUFFER,
+			Alignment: 0,
+			Width: constant_buffer_size as u64,
+			Height: 1,
+			DepthOrArraySize: 1,
+			MipLevels: 1,
+			Format: dxgiformat::DXGI_FORMAT_UNKNOWN,
+			SampleDesc: dxgitype::DXGI_SAMPLE_DESC {
+				Count: 1,
+				Quality: 0,
+			},
+			Layout: d3d12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+			Flags: d3d12::D3D12_RESOURCE_FLAG_NONE,
+		};
+
+		let mut constant_buffer = WeakPtr::<d3d12::ID3D12Resource>::null();
+
+		unsafe 
+		{
+			let hr_create_constant_buffer = self.device.CreateCommittedResource(
+				&default_heap_properties,
+				d3d12::D3D12_HEAP_FLAG_NONE,
+				&constant_buffer_resource_desc,
+				d3d12::D3D12_RESOURCE_STATE_GENERIC_READ,
+				ptr::null(),
+				&d3d12::ID3D12Resource::uuidof(),
+				constant_buffer.mut_void());
+
+			assert!(winerror::SUCCEEDED(hr_create_constant_buffer), "Failed to create constant buffer. 0x{:x}", hr_create_constant_buffer);
+
+			let buffer_name : String = String::from("constant buffer b0");
+			let buffer_size = u32::try_from(buffer_name.len()).unwrap();
+			constant_buffer.SetPrivateData(&d3dcommon::WKPDID_D3DDebugObjectName, buffer_size, buffer_name.as_ptr() as * mut _);
+		}
+
+		// Describe and create a constant buffer view.
+		unsafe
+		{
+			let cbv_desc = d3d12::D3D12_CONSTANT_BUFFER_VIEW_DESC {
+				BufferLocation : constant_buffer.GetGPUVirtualAddress(),
+				SizeInBytes : u32::try_from(constant_buffer_size).unwrap(),
+			};
+
+			self.device.CreateConstantBufferView(&cbv_desc, self.cbv_descriptor_heap.GetCPUDescriptorHandleForHeapStart());
+
+			let cbv_srv_gpu_handle = 
+				CD3D12_GPU_DESCRIPTOR_HANDLE::from(self.cbv_descriptor_heap.GetGPUDescriptorHandleForHeapStart());
+			self.constant_buffer_gpu_handle = cbv_srv_gpu_handle;
+		}
+
+		// Map the constant buffers and cache their heap pointers.
+		// We don't unmap this until the app closes. Keeping things mapped for the lifetime of the resource is okay.
+		unsafe 
+		{
+			let mut p_constant_buffer_data_begin = ptr::null_mut::<winapi::ctypes::c_void>();
+			let read_range = d3d12::D3D12_RANGE { Begin: 0 , End: 0 };
+			let hr_map = constant_buffer.Map(0, &read_range, &mut p_constant_buffer_data_begin);
+			assert!(winerror::SUCCEEDED(hr_map), "Failed to map constant buffer. 0x{:x}", hr_map);
+			assert!(!p_constant_buffer_data_begin.is_null(), "Failed to map constant buffer. 0x{:x}", hr_map);
+
+			self.p_cbv_data = p_constant_buffer_data_begin as * mut MatrixConstantBuffer;
+
+			// Initialize the constant buffer. 
+			let initial_matrix = <Matrix4::<f32> as cgmath::Transform::<cgmath::Point3::<f32>> >::one();
+			std::ptr::copy_nonoverlapping(
+				&initial_matrix,
+				self.p_cbv_data as * mut Matrix4<f32>,
+				1);
+		}
+
+		self.constant_buffer = constant_buffer;
+
+		
+
 	}
 
 	// Create synchronization objects and wait until assets have been uploaded to the GPU.
+	unsafe
 	{
-		unsafe 
-		{
-			let hr_create_fence = self.device.CreateFence(
-				self.fence_values[self.frame_index],
-				d3d12::D3D12_FENCE_FLAG_NONE,
-				&d3d12::ID3D12Fence::uuidof(),
-				self.fence.mut_void());
-			assert!(winerror::SUCCEEDED(hr_create_fence), "Failed to create fence. 0x{:x}", hr_create_fence);
+		let hr_create_fence = self.device.CreateFence(
+			self.fence_values[self.frame_index],
+			d3d12::D3D12_FENCE_FLAG_NONE,
+			&d3d12::ID3D12Fence::uuidof(),
+			self.fence.mut_void());
+		assert!(winerror::SUCCEEDED(hr_create_fence), "Failed to create fence. 0x{:x}", hr_create_fence);
 
-			self.fence_values[self.frame_index] += 1;
+		self.fence_values[self.frame_index] += 1;
 
-			// Create an event handle to use for frame synchronization.
-			self.fence_event = CreateEventW(ptr::null_mut(), FALSE, FALSE, ptr::null());
-			assert!(self.fence_event != ptr::null_mut(), "Failed to create fence. 0x{:?}", Error::last_os_error());
+		// Create an event handle to use for frame synchronization.
+		self.fence_event = CreateEventW(ptr::null_mut(), FALSE, FALSE, ptr::null());
+		assert!(self.fence_event != ptr::null_mut(), "Failed to create fence. 0x{:?}", Error::last_os_error());
 
-			// Wait for the command list to execute
-			self.wait_for_gpu()
-		}
+		// Wait for the command list to execute
+		self.wait_for_gpu()
 	}
 }
 
 pub fn update(&mut self)
 {
-	// Nothing to do here. This sample has no simulation work.
+	let time_elapsed = self.timer.elapsed().as_secs_f32();
+	let model = Matrix4::from_angle_y(Rad::from(Deg(time_elapsed*90.0)));
+
+	let eye = Point3::new(0.0, 0.66, -2.5);
+	let target = Point3::new(0.0, 0.66, 0.0);
+	let up = Vector3::unit_y();
+	let view_lh = transforms::look_at_lh(eye, target, up);
+
+	let perspective = PerspectiveFov {
+		fovy : cgmath::Rad(FOVY.to_radians()), 
+		aspect : ASPECT_RATIO,
+		near : 0.1,
+		far : 100.0};
+
+	let proj_lh = transforms::perspective_lh(perspective);
+	
+	let buffer_data = MatrixConstantBuffer { 
+		mvp_transform : proj_lh * view_lh * model , 
+		_padding : unsafe { std::mem::zeroed() } 
+	};
+
+	unsafe
+	{
+		std::ptr::copy_nonoverlapping(&buffer_data, self.p_cbv_data, 1);
+	}
 }
 
 pub fn render(&mut self) -> i32
@@ -857,7 +1008,10 @@ pub fn _destroy(&mut self)
     // cleaned up by the destructor.
 	self.wait_for_gpu();
 
-    unsafe { winapi::um::handleapi::CloseHandle(self.fence_event); }
+	unsafe { winapi::um::handleapi::CloseHandle(self.fence_event); }
+	
+	unsafe { self.constant_buffer.Unmap(0, ptr::null()) };
+	self.p_cbv_data = ptr::null_mut();
 }
 
 pub fn populate_command_list(&mut self)
@@ -871,6 +1025,12 @@ pub fn populate_command_list(&mut self)
 		assert!(winerror::SUCCEEDED(hr_command_reset), "Failed to reset command list. 0x{:x}", hr_command_reset);
 
 		self.command_list.SetGraphicsRootSignature(self.root_signature.as_mut_ptr());
+
+		let mut descriptor_heaps = [ self.cbv_descriptor_heap.as_mut_ptr() ];
+		self.command_list.SetDescriptorHeaps(descriptor_heaps.len() as u32, descriptor_heaps.as_mut_ptr());
+		const CBV_SLOT : u32 = 0;
+		self.command_list.SetGraphicsRootDescriptorTable(CBV_SLOT, self.cbv_descriptor_heap.GetGPUDescriptorHandleForHeapStart());
+
 		self.command_list.RSSetViewports(1, &self.viewport);
 		self.command_list.RSSetScissorRects(1, &self.scissor_rect);
 
@@ -893,10 +1053,9 @@ pub fn populate_command_list(&mut self)
 
 		let clear_color : [f32 ; 4] = [0.0, 0.2, 0.4, 1.0];
 		self.command_list.ClearRenderTargetView(rtv_handle.0, &clear_color, 0, ptr::null());
-
 		self.command_list.IASetPrimitiveTopology(d3dcommon::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		self.command_list.IASetVertexBuffers(0, 1, &self.vertex_buffer_view);
-		let vertex_count = 3;
+		let vertex_count = 12; // TODO: Make this not hardcoded.
 		let instance_count= 1;
 		let start_vertex_location = 0;
 		let start_instance_location = 0;

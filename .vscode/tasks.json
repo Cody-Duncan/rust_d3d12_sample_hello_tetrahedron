@@ -32,6 +32,19 @@
 			]
 		},
 		{
+			"label": "build test",
+			"args": [
+				"test",
+				"-v",
+			],
+			"command": "cargo",
+			"group": "test",
+			"problemMatcher": [
+				"$rustc"
+			]
+		},
+
+		{
 			"label": "check",
 			"args": [
 				"check",
