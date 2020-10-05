@@ -17,8 +17,6 @@ use std::{
 // Main Function
 fn main()
 {
-	println!("Hello, Rust!");
-
 	let (window_sender, window_reciever) = mpsc::channel::<win_window::Window>();
 	let (exit_sender, _exit_receiver) = mpsc::channel::<win_platform::ExitResult>();
 	let (input_sender, _input_receiver) = mpsc::channel::<u32>();
