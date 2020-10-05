@@ -1,29 +1,31 @@
 // Declare Modules
-mod win_window;
-mod win_utilities;
-mod win_platform;
 pub mod dx_descriptor_handles;
 mod dx_renderer;
 mod geometry;
 mod transforms;
 pub mod weak_ptr;
+mod win_platform;
+mod win_utilities;
+mod win_window;
 
 // Use Declarations
-use std::thread;
-use std::sync::mpsc;
+use std::{
+	sync::mpsc,
+	thread,
+};
 
 // Main Function
-fn main() 
+fn main()
 {
 	println!("Hello, Rust!");
 
 	let (window_sender, window_reciever) = mpsc::channel::<win_window::Window>();
 	let (exit_sender, _exit_receiver) = mpsc::channel::<win_platform::ExitResult>();
 	let (input_sender, _input_receiver) = mpsc::channel::<u32>();
-	
-	let windows_thread= thread::Builder::new()
+
+	let windows_thread = thread::Builder::new()
 		.name("win_platform_thread".to_string())
-		.spawn(move || {win_platform::platform_thread_run(window_sender, exit_sender, input_sender)})
+		.spawn(move || win_platform::platform_thread_run(window_sender, exit_sender, input_sender))
 		.expect("failed to spin up win_platform_thread");
 
 	let window = window_reciever.recv().unwrap();
@@ -32,7 +34,7 @@ fn main()
 	renderer.load_pipeline(window);
 	renderer.load_assets();
 
-	use std::time::{Instant};
+	use std::time::Instant;
 
 	// timing measures for Frames-Per-Second
 	let now = Instant::now();
@@ -52,27 +54,27 @@ fn main()
 			}
 			count += 1;
 		}
-		
+
 		renderer.update();
 		let result = renderer.render();
 
 		if result != 0
-		{ 
-			break; 
+		{
+			break;
 		}
 
 		let try_exit_result = _exit_receiver.try_recv();
 		match try_exit_result
 		{
 			Err(_) => (), // nothing received fromt the platform thread
-			Ok(exit_result) => 
+			Ok(exit_result) =>
 			{
 				match exit_result
 				{
 					Ok(exit_code) => println!("Platform Thread Exited Successfully. Exit Code {:?}", exit_code),
 					Err(platform_error) => println!("Platform Thread Exited with Error: {:?}", platform_error),
 				}
-				break
+				break;
 			}
 		}
 	}
