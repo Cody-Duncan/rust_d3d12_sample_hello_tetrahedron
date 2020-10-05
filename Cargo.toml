@@ -1,5 +1,5 @@
 [package]
-name = "rust_raytracer"
+name = "rust_d3d12_sample_hellotetrahedron"
 version = "0.1.0"
 authors = ["Cody Duncan <programming@codyduncan.net>"]
 edition = "2018"
