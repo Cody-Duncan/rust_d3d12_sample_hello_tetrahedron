@@ -1,10 +1,13 @@
-extern crate d3d12_rs;
+//extern crate d3d12_rs;
 extern crate winapi;
 use crate::win_window;
 use crate::geometry::*;
 use crate::transforms;
 use crate::dx_descriptor_handles::{CD3D12_CPU_DESCRIPTOR_HANDLE, CD3D12_GPU_DESCRIPTOR_HANDLE};
+use crate::weak_ptr::WeakPtr;
 use cgmath::*;
+
+pub use winapi::shared::winerror::HRESULT;
 
 use winapi::{
 	shared::{
@@ -38,7 +41,7 @@ use std::{
 	convert::TryFrom,
 };
 
-use d3d12_rs::WeakPtr;
+
 
 const G_MAX_FRAME_COUNT : usize = 3;
 const G_SINGLE_NODEMASK : u32 = 0;
@@ -108,7 +111,7 @@ pub fn new() -> Self
 		};
 		assert!(winerror::SUCCEEDED(hr_debug), "Unable to get D3D12 debug interface. {:x}", hr_debug);
 		
-		debug_controller.enable_layer();
+		unsafe { debug_controller.EnableDebugLayer(); }
 
 		unsafe { debug_controller.Release(); } // Clean Up
 	}
@@ -169,7 +172,7 @@ pub fn load_pipeline(&mut self, window : win_window::Window)
             winapi::um::d3d12::D3D12GetDebugInterface(&d3d12sdklayers::ID3D12Debug::uuidof(), debug_controller.mut_void())};
 		assert!(winerror::SUCCEEDED(hr_debug), "Unable to get D3D12 debug interface. {:x}", hr_debug);
 		
-		debug_controller.enable_layer();
+		unsafe { debug_controller.EnableDebugLayer(); }
 
 		unsafe { debug_controller.Release(); } // Clean Up
 	}
@@ -332,8 +335,8 @@ pub fn load_pipeline(&mut self, window : win_window::Window)
 	// Create Render Target Views on the RTV Heap
 	let rtv_descriptor_size = unsafe { self.device.GetDescriptorHandleIncrementSize(heap_type as _) };
 	self.rtv_descriptor_size = rtv_descriptor_size;
-	let rtv_heap_cpu_handle = rtv_descriptor_heap.start_cpu_descriptor();
-	let _rtv_heap_gpu_handle = rtv_descriptor_heap.start_gpu_descriptor();
+	let rtv_heap_cpu_handle = unsafe { rtv_descriptor_heap.GetCPUDescriptorHandleForHeapStart() };
+	let _rtv_heap_gpu_handle = unsafe { rtv_descriptor_heap.GetGPUDescriptorHandleForHeapStart() };
 
 	let write_render_targets= & mut self.render_targets[0..(self.frame_count as usize)];
 
@@ -492,7 +495,11 @@ pub fn load_assets(&mut self)
 	{
 		println!(
 			"Root signature serialization error: {:?}",
-			unsafe { signature_error.as_c_str().to_str().unwrap() }
+			unsafe 
+			{
+				let data = signature_error.GetBufferPointer();
+       			CStr::from_ptr(data as *const _ as *const _)
+			}.to_str().unwrap()
 		);
 		unsafe { signature_error.destroy(); }
 	}

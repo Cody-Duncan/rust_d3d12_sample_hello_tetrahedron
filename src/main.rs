@@ -6,6 +6,7 @@ pub mod dx_descriptor_handles;
 mod dx_renderer;
 mod geometry;
 mod transforms;
+pub mod weak_ptr;
 
 // Use Declarations
 use std::thread;
