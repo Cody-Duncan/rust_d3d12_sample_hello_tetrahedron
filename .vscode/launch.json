@@ -8,7 +8,7 @@
             "type": "cppvsdbg", 
             "request": "launch",
             "name": "Debug",
-            "program": "${fileDirname}/../target/debug/rust_raytracer.exe",
+            "program": "${workspaceFolder}/target/debug/rust_d3d12_sample_hello_tetrahedron.exe",
             "args": [],
 			"cwd": "${workspaceRoot}",
 			"environment": 
@@ -20,7 +20,7 @@
             "type": "cppvsdbg", 
             "request": "launch",
             "name": "Release",
-            "program": "${fileDirname}/../target/release/rust_raytracer.exe",
+            "program": "${workspaceFolder}/target/release/rust_d3d12_sample_hello_tetrahedron.exe",
             "args": [],
             "cwd": "${workspaceRoot}"
         }
